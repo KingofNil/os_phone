@@ -3330,14 +3330,14 @@ local function tryLogin(a, phone)
   return true
 end
 
--- ============ Commissions (file d'envoi vers l'API) ============
--- Envoi HTTP NON bloquant : la reponse arrive par http_success /
--- http_failure dans la boucle principale (une seule requete a la fois,
--- l'URL suffit donc a l'identifier). Si le site est injoignable, la file
--- persiste dans fees.tbl et on reessaie automatiquement.
-local FEE_URL = VSMP_API_URL .. "/enterprise/deposit"
+-- ============ Commissions (envoi a l'API V-SMP) ================
+-- MEME systeme d'appel que le ServeurCentral V-SMP (serv admin) :
+-- callAPI BLOQUANT -> http.request puis attente de http_success /
+-- http_failure pour cette URL. Les commissions refusees restent dans
+-- fees.tbl : 5 refus du site = abandon ; aucune reponse = re-essai
+-- sans limite. L'appel se fait APRES avoir repondu au client.
 local feeQueue, feeTotal = {}, 0
-local feeInFlight, feeRetryAt, feeHttpWarned = false, 0, false
+local feeRetryAt, feeHttpWarned = 0, false
 
 local function loadFees()
   if fs.exists(FEESFILE) then
@@ -3355,90 +3355,110 @@ local function feeOf(amount)
   return math.min(amount - 1, math.ceil(amount * TAX_RATE))
 end
 
-local function nonce()
-  return (("xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx"):gsub("[xy]", function(c)
+local function generateUUID()
+  local template = "xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx"
+  return string.gsub(template, "[xy]", function(c)
     local v = (c == "x") and math.random(0, 0xf) or math.random(8, 0xb)
     return string.format("%x", v)
-  end))
+  end)
 end
 
--- envoie la 1re commission de la file (si aucune requete deja en cours)
-local function flushFees()
-  if feeInFlight or #feeQueue == 0 or os.clock() < feeRetryAt then return end
+-- Copie conforme du callAPI du ServeurCentral V-SMP (serv admin) :
+-- envoie la requete puis BLOQUE jusqu'a la reponse http de cette URL.
+local function callAPI(endpoint, data)
+  local url = VSMP_API_URL .. endpoint
+  local headers = {
+    ["X-API-Key"]       = VSMP_API_KEY,
+    ["X-Request-Nonce"] = generateUUID(),
+    ["Content-Type"]    = "application/json",
+  }
+  http.request({
+    url     = url,
+    headers = headers,
+    method  = data and "POST" or "GET",
+    body    = data and textutils.serializeJSON(data) or nil,
+  })
+  local event, url_reply, p1, p2
+  repeat
+    event, url_reply, p1, p2 = os.pullEvent()
+  until (event == "http_success" or event == "http_failure") and url_reply == url
+  if event == "http_failure" then
+    local errMsg = tostring(p1)
+    local code   = 0
+    if p2 then
+      local body2 = p2.readAll and p2.readAll() or ""
+      code        = p2.getResponseCode and p2.getResponseCode() or 0
+      p2.close()
+      if body2 ~= "" then errMsg = errMsg .. " | " .. body2 end
+    end
+    return false, errMsg, code
+  end
+  local handle = p1
+  local code   = handle.getResponseCode()
+  local body   = handle.readAll()
+  handle.close()
+  local ok, parsed = pcall(textutils.unserializeJSON, body)
+  if not ok then return false, "Reponse JSON invalide", code end
+  return true, parsed, code
+end
+
+-- Envoie UNE commission. true si livree ; sinon (false, message, codeHTTP)
+-- (code 0 = aucune reponse du site).
+local function sendFee(rec)
   if not http then
     if not feeHttpWarned then log("Commissions : API http desactivee (config CC) !"); feeHttpWarned = true end
-    return
+    return false, "http desactive", 0
   end
-  local f = feeQueue[1]
-  http.request({
-    url = FEE_URL, method = "POST",
-    headers = { ["X-API-Key"] = VSMP_API_KEY, ["X-Request-Nonce"] = nonce(),
-                ["Content-Type"] = "application/json" },
-    body = textutils.serializeJSON({ username = f.user, amount = f.amount,
-                                     enterprise = TAX_ENTERPRISE }),
-  })
-  feeInFlight = true
+  local ok, res, code = callAPI("/enterprise/deposit",
+    { username = rec.user, amount = rec.amount, enterprise = TAX_ENTERPRISE })
+  if ok and not (type(res) == "table" and res.error) then return true end
+  local msg
+  if type(res) == "table" then msg = tostring(res.error or res.message or "erreur API")
+  else msg = tostring(res) end
+  return false, msg, code or 0
 end
 
--- Preleve la commission sur une transaction : la met en file d'envoi
--- vers TAX_ENTERPRISE. Renvoie le montant preleve.
-local function takeFee(user, amount)
-  local f = feeOf(amount)
-  if f > 0 then
-    feeTotal = feeTotal + f
-    feeQueue[#feeQueue + 1] = { user = user, amount = f, time = os.epoch("utc") }
-    saveFees()
+-- Livre la commission a l'entreprise (appel API bloquant, comme le
+-- ServeurCentral). A appeler APRES avoir repondu au client : l'appel
+-- peut prendre quelques secondes. En cas d'echec -> file de rattrapage.
+local function deliverFee(user, f)
+  if f <= 0 then return end
+  feeTotal = feeTotal + f
+  local rec = { user = user, amount = f, time = os.epoch("utc") }
+  local ok, err, code = sendFee(rec)
+  if ok then
     log(("Commission %d (%s) -> %s"):format(f, user, TAX_ENTERPRISE))
-    flushFees()
+  else
+    rec.fails = (code ~= 0) and 1 or 0
+    feeQueue[#feeQueue + 1] = rec
+    log("Commission refusee : " .. tostring(err))
+    feeRetryAt = os.clock() + 60
   end
-  return f
+  saveFees()
 end
 
--- reponse de l'API pour la commission en cours (appele par la boucle principale)
--- Trois cas :
---  - succes -> commission livree, on passe a la suivante ;
---  - REFUS du site (erreur applicative OU code HTTP 4xx/5xx : cle refusee,
---    IP non autorisee, pseudo/entreprise inconnu...) -> le VRAI message de
---    l'API est logge, 5 essais puis abandon (ne bloque pas la file) ;
---  - echec de CONNEXION (aucune reponse) -> nouvel essai sans limite.
-local function onFeeResponse(okHttp, handle, err)
-  feeInFlight = false
-  local refusal
-  if handle then
-    local body = ""
-    pcall(function() body = handle.readAll() or "" end)
-    pcall(handle.close)
-    local okj, res = pcall(textutils.unserializeJSON, body)
-    local apiMsg = (okj and type(res) == "table") and (res.error or res.message) or nil
-    if not okHttp then
-      refusal = tostring(apiMsg or err)   -- le site a repondu par une erreur HTTP
-    elseif apiMsg then
-      refusal = tostring(apiMsg)          -- HTTP 200 mais erreur applicative
+-- Rattrapage periodique des commissions en echec (1 essai max par tick).
+local function retryFees()
+  if #feeQueue == 0 or os.clock() < feeRetryAt or not http then return end
+  local rec = feeQueue[1]
+  local ok, err, code = sendFee(rec)
+  if ok then
+    table.remove(feeQueue, 1)
+    log(("Commission rattrapee : %d (%s)"):format(rec.amount, rec.user))
+  elseif code ~= 0 then
+    -- le site a repondu par un refus : 5 essais puis abandon
+    rec.fails = (rec.fails or 0) + 1
+    if rec.fails >= 5 then
+      table.remove(feeQueue, 1)
+      log("Commission ABANDONNEE (" .. tostring(err) .. ") : " .. rec.amount .. " de " .. rec.user)
+    else
+      feeRetryAt = os.clock() + 60
     end
-  elseif not okHttp then
-    -- aucune reponse du tout : vraie panne reseau, on garde la commission
-    log("Commissions : site injoignable (" .. tostring(err) .. ")")
-    feeRetryAt = os.clock() + 30
-    flushFees()
-    return
-  end
-  if refusal then
-    local f = table.remove(feeQueue, 1)
-    if f then
-      f.fails = (f.fails or 0) + 1
-      if f.fails >= 5 then
-        log("Commission ABANDONNEE (" .. refusal .. ") : " .. f.amount .. " de " .. f.user)
-      else
-        feeQueue[#feeQueue + 1] = f
-        log("Commission refusee par l'API : " .. refusal)
-        feeRetryAt = os.clock() + 60
-      end
-    end
-    saveFees()
   else
-    table.remove(feeQueue, 1); saveFees()
+    -- aucune reponse : vraie panne reseau, on garde et on reessaie
+    feeRetryAt = os.clock() + 30
   end
-  flushFees()
+  saveFees()
 end
 
 -- ============ Reseau ============================================
@@ -3809,7 +3829,7 @@ local function handle(senderId, msg)
       elseif a.balance < amount then
         rednet.send(senderId, { ok = false, action = "bank_transfer", error = "solde insuffisant" }, PROTO)
       else
-        local f = takeFee(a.user, amount)
+        local f = feeOf(amount)
         a.balance = a.balance - amount; dest.balance = dest.balance + (amount - f); saveAccounts()
         log(("Transfert %d (comm. %d) : %s -> %s"):format(amount, f, a.user, dest.user))
         for pid, c in pairs(clients) do
@@ -3820,6 +3840,7 @@ local function handle(senderId, msg)
         end
         rednet.send(senderId, { ok = true, action = "bank_transfer", balance = a.balance,
                                 fee = f, net = amount - f }, PROTO)
+        deliverFee(a.user, f)
       end
     end
 
@@ -3839,12 +3860,13 @@ local function handle(senderId, msg)
     if not a then rednet.send(senderId, { ok = false, action = "atm_deposit", error = "compte introuvable" }, PROTO)
     elseif amount <= 0 then rednet.send(senderId, { ok = false, action = "atm_deposit", error = "montant invalide" }, PROTO)
     else
-      local f = takeFee(a.user, amount)
+      local f = feeOf(amount)
       a.balance = a.balance + (amount - f); saveAccounts()
       log(("ATM depot %d (comm. %d) -> %s (%d)"):format(amount, f, a.user, a.balance))
       for pid, c in pairs(clients) do if c.uid == a.uid then
         rednet.send(pid, { ok = true, action = "bank_event", text = "Depot ATM +" .. (amount - f), balance = a.balance }, PROTO) end end
       rednet.send(senderId, { ok = true, action = "atm_deposit", balance = a.balance, fee = f, net = amount - f }, PROTO)
+      deliverFee(a.user, f)
     end
 
   elseif msg.action == "atm_withdraw" then
@@ -3856,12 +3878,13 @@ local function handle(senderId, msg)
     elseif amount <= 0 then rednet.send(senderId, { ok = false, action = "atm_withdraw", error = "montant invalide" }, PROTO)
     elseif a.balance < amount then rednet.send(senderId, { ok = false, action = "atm_withdraw", error = "solde insuffisant" }, PROTO)
     else
-      local f = takeFee(a.user, amount)
+      local f = feeOf(amount)
       a.balance = a.balance - amount; saveAccounts()
       log(("ATM retrait %d (comm. %d) -> %s (%d)"):format(amount, f, a.user, a.balance))
       for pid, c in pairs(clients) do if c.uid == a.uid then
         rednet.send(pid, { ok = true, action = "bank_event", text = "Retrait ATM -" .. amount, balance = a.balance }, PROTO) end end
       rednet.send(senderId, { ok = true, action = "atm_withdraw", balance = a.balance, fee = f, net = amount - f }, PROTO)
+      deliverFee(a.user, f)
     end
 
   elseif msg.action == "atm_app" then
@@ -4042,7 +4065,6 @@ do local n = 0; for _ in pairs(accounts) do n = n + 1 end
 if TAX_RATE > 0 then
   log(("Commission %d%% -> %s (%d en attente d'envoi)"):format(
     math.floor(TAX_RATE * 100 + 0.5), TAX_ENTERPRISE, #feeQueue))
-  flushFees()
 end
 
 -- Credit/debit d'un compte depuis le terminal serveur (touche C)
@@ -4079,12 +4101,8 @@ while true do
     for id, c in pairs(clients) do
       if c.last and now - c.last > SESSION_TIMEOUT then clients[id] = nil end
     end
-    flushFees()   -- reessaie l'envoi des commissions apres un echec
+    retryFees()   -- reessaie l'envoi des commissions apres un echec
     redraw()
-  elseif ev[1] == "http_success" and ev[2] == FEE_URL then
-    onFeeResponse(true, ev[3]); redraw()
-  elseif ev[1] == "http_failure" and ev[2] == FEE_URL then
-    onFeeResponse(false, ev[4], ev[3]); redraw()
   elseif ev[1] == "rednet_message" and ev[4] == PROTO then
     handle(ev[2], ev[3]); redraw()
   elseif ev[1] == "monitor_touch" then
