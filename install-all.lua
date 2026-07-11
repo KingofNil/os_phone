@@ -3513,19 +3513,46 @@ local function mcUUID(a)
   return a.mcuuid
 end
 
+-- Mojang renvoie l'UUID SANS tirets ; les plugins Java le stockent
+-- generalement AVEC (8-4-4-4-12). On sait produire les deux formes.
+local function dashUUID(id)
+  id = tostring(id):gsub("%-", "")
+  if #id ~= 32 then return nil end
+  return id:sub(1, 8) .. "-" .. id:sub(9, 12) .. "-" .. id:sub(13, 16)
+      .. "-" .. id:sub(17, 20) .. "-" .. id:sub(21, 32)
+end
+
+-- lit le solde pour UN uuid donne ; (nombre) ou (nil, erreur)
+local function fetchBalance(uuid)
+  local ok, res = callAPI("/bank/balance/" .. uuid)
+  if ok then
+    local b = tonumber(type(res) == "table" and (res.balance or res.amount or res.money) or res)
+    if b then return b end
+  end
+  local msg = type(res) == "table" and (res.error or res.message) or res
+  return nil, tostring(msg or "erreur API")
+end
+
 -- Solde lu sur le SITE. Renvoie (nombre) ou (nil, erreur).
--- Le dernier solde connu est cache dans a.balance (listes / hors-ligne).
+-- Essaie l'UUID cache puis l'AUTRE format (avec/sans tirets) et memorise
+-- celui que le site reconnait. Dernier solde connu cache dans a.balance.
 local function apiBalance(a)
   if not http then return nil, "http desactive" end
   local uuid = mcUUID(a)
   if not uuid then return nil, "pseudo Minecraft introuvable" end
-  local ok, res = callAPI("/bank/balance/" .. uuid)
-  if ok then
-    local b = tonumber(type(res) == "table" and (res.balance or res.amount or res.money) or res)
-    if b then a.balance = b; return b end
+  local b, err = fetchBalance(uuid)
+  if not b then
+    local alt = uuid:find("-", 1, true) and uuid:gsub("%-", "") or dashUUID(uuid)
+    if alt and alt ~= uuid then
+      local b2 = fetchBalance(alt)
+      if b2 then
+        a.mcuuid = alt; saveAccounts()   -- le site reconnait CE format
+        b, err = b2, nil
+      end
+    end
   end
-  local msg = type(res) == "table" and (res.error or res.message) or res
-  return nil, tostring(msg or "erreur API")
+  if b then a.balance = b; return b end
+  return nil, err
 end
 
 -- solde a afficher : valeur fraiche du site si possible, sinon le cache
