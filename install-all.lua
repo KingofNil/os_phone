@@ -272,9 +272,12 @@ end
 ]=]
 files["atm/cobble/atm.lua"] = [=[
 -- PIL ATM : distributeur de la Banque KIT.
--- On insere son TELEPHONE dans un LECTEUR DE DISQUE relie a cet ordinateur ;
--- il se monte sur /disk et l'ATM lit /disk/secu/id (l'identifiant du compte).
--- Puis : code banque (pave tactile) -> depot / retrait. Interface graphique.
+-- Deux modes d'acces :
+--  1) TELEPHONE insere dans le LECTEUR DE DISQUE (monte sur /disk,
+--     l'ATM lit /disk/secu/id) -> aucun pseudo demande ;
+--  2) PSEUDO tape au clavier (bouton sur l'ecran d'accueil) -> session
+--     avec deconnexion auto apres 45 s d'inactivite.
+-- Le RETRAIT exige le code banque dans les deux cas. Interface graphique.
 -- Reutilise le moteur UI de l'OS (cobble/ui.lua, gfx.lua, net.lua).
 local ROOT = "cobble/"
 local ui  = dofile(ROOT .. "ui.lua")
@@ -354,13 +357,21 @@ local function header(title)
   gfx.right(W, 1, textutils.formatTime(os.time(), true), colors.white, colors.green)
 end
 
+local pseudoBtn
 local function drawInsert(warn)
   local W, H = term.getSize()
   gfx.begin(colors.black)
   header("Banque KIT - ATM")
-  ui.center(math.floor(H / 2) - 2, "Inserez votre telephone", colors.white)
-  ui.center(math.floor(H / 2) - 1, "dans le lecteur de disque", colors.lightGray)
-  if warn then ui.center(math.floor(H / 2) + 2, warn, colors.red) end
+  ui.center(math.floor(H / 2) - 4, "Inserez votre telephone", colors.white)
+  ui.center(math.floor(H / 2) - 3, "dans le lecteur de disque", colors.lightGray)
+  ui.center(math.floor(H / 2) - 1, "- ou -", colors.gray)
+  local lab = " Taper son pseudo "
+  local bx = math.floor((W - #lab) / 2) + 1
+  local by = math.floor(H / 2) + 1
+  gfx.roundRect(bx, by, #lab, 1, colors.blue, colors.black)
+  gfx.text(bx, by, lab, colors.white, colors.blue)
+  pseudoBtn = { x = bx, y = by, w = #lab, h = 1 }
+  if warn then ui.center(by + 2, warn, colors.red) end
   ui.center(H - 1, "Banque KIT", colors.green)
 end
 
@@ -371,24 +382,34 @@ local function drawRemove()
   ui.center(math.floor(H / 2), "Merci ! Retirez votre telephone.", colors.yellow)
 end
 
--- Attend qu'un telephone valide soit insere ; renvoie la carte.
+-- Attend un telephone insere OU la saisie d'un pseudo au clavier.
+-- Renvoie { uid=, byCard=true } (tel) ou { user= } (pseudo).
 local function waitInsert()
   drawInsert()
   while true do
     os.startTimer(1)
-    local ev = os.pullEvent()
+    local ev = { os.pullEvent() }
     local card, why = readCard()
-    if card then return card end
-    if ev == "disk" or ev == "disk_eject" or ev == "timer" then
+    if card then card.byCard = true; return card end
+    if ev[1] == "mouse_click" or ev[1] == "monitor_touch" then
+      if ui.hit(pseudoBtn, ev[3], ev[4]) then
+        local u = ui.input("Ton pseudo")
+        if u and u ~= "" then return { user = u } end
+        drawInsert()
+      end
+    elseif ev[1] == "disk" or ev[1] == "disk_eject" or ev[1] == "timer" then
       drawInsert(why == "present" and "Telephone non reconnu (pas de compte)" or nil)
     end
   end
 end
 
--- Ecran du compte : solde + gros boutons. Surveille l'ejection du tel.
-local function accountScreen(info)
+-- Ecran du compte : solde + gros boutons. Surveille l'ejection du tel
+-- (mode carte) ou l'inactivite (mode pseudo : deconnexion auto apres 45 s).
+local function accountScreen(info, byCard)
   local W, H = term.getSize()
   local btns
+  local IDLE_LIMIT = 45
+  local lastAct = os.clock()
   local function draw()
     gfx.begin(colors.black)
     header("Banque KIT - ATM")
@@ -407,18 +428,23 @@ local function accountScreen(info)
     end
     big(6, "Deposer", colors.green, "deposit")
     big(9, "Retirer", colors.orange, "withdraw")
-    big(H - 2, "Ejecter / Fin", colors.red, "eject")
+    big(H - 2, byCard and "Ejecter / Fin" or "Terminer", colors.red, "eject")
   end
   draw()
   while true do
     os.startTimer(1)
     local ev = { os.pullEvent() }
     if ev[1] == "timer" then
-      if not readCard() then return "eject" end
+      if byCard then
+        if not readCard() then return "eject" end
+      elseif os.clock() - lastAct > IDLE_LIMIT then
+        return "eject"   -- session pseudo abandonnee -> retour accueil
+      end
       draw()
     elseif ev[1] == "disk_eject" then
-      return "eject"
+      if byCard then return "eject" end
     elseif ev[1] == "mouse_click" or ev[1] == "monitor_touch" then
+      lastAct = os.clock()
       for _, b in ipairs(btns) do if ui.hit(b, ev[3], ev[4]) then return b.id end end
     end
   end
@@ -428,7 +454,7 @@ local function doDeposit(card, info)
   local amtS = ui.keypad("Depot - montant", { hint = "montant" })
   local amt = tonumber(amtS)
   if not amt then return end
-  local r = net.request({ action = "atm_deposit", uid = card.uid, amount = amt }, 6)
+  local r = net.request({ action = "atm_deposit", uid = card.uid, user = card.user, amount = amt }, 6)
   if r and r.ok then
     info.balance = r.balance
     local lines = { "Credite : +" .. (r.net or math.floor(amt)) .. " $" }
@@ -448,7 +474,7 @@ local function doWithdraw(card, info)
   local amtS = ui.keypad("Retrait - montant", { hint = "montant" })
   local amt = tonumber(amtS)
   if not amt then return end
-  local r = net.request({ action = "atm_withdraw", uid = card.uid, amount = amt, bankpass = code }, 6)
+  local r = net.request({ action = "atm_withdraw", uid = card.uid, user = card.user, amount = amt, bankpass = code }, 6)
   if r and r.ok then
     info.balance = r.balance
     local lines = { "Remis : " .. (r.net or math.floor(amt)) .. " $" }
@@ -459,14 +485,15 @@ local function doWithdraw(card, info)
 end
 
 local function session(card)
-  local info = net.request({ action = "atm_info", uid = card.uid }, 6)
+  local info = net.request({ action = "atm_info", uid = card.uid, user = card.user }, 6)
   if not (info and info.ok) then
     ui.message("ATM", { (info and info.error) or "Serveur injoignable" })
     return
   end
+  if info.uid then card.uid = info.uid end   -- resolu par pseudo -> memorise l'uid
   while true do
-    if not readCard() then return end   -- tel retire
-    local act = accountScreen(info)
+    if card.byCard and not readCard() then return end   -- tel retire
+    local act = accountScreen(info, card.byCard)
     if act == "eject" then return
     elseif act == "deposit" then doDeposit(card, info)
     elseif act == "withdraw" then doWithdraw(card, info) end
@@ -481,8 +508,8 @@ end
 while true do
   local card = waitInsert()
   session(card)
-  -- attendre le retrait physique du tel avant de reproposer l'insertion
-  while readCard() do
+  -- mode carte : attendre le retrait physique du tel avant de reproposer
+  while card.byCard and readCard() do
     drawRemove()
     os.startTimer(1); os.pullEvent()
   end
@@ -945,7 +972,12 @@ il doit correspondre a un pseudo connu du site V-SMP.
 NECESSITE l'API http de ComputerCraft activee (config par defaut : oui).
 
 --- BORNE ATM (distributeur) ---
-Machine ou l'on DEPOSE / RETIRE de l'argent en inserant son TELEPHONE.
+Machine ou l'on DEPOSE / RETIRE de l'argent. Deux modes d'acces :
+  1) inserer son TELEPHONE dans le lecteur (aucun pseudo demande) ;
+  2) bouton "Taper son pseudo" sur l'ecran d'accueil (clavier PHYSIQUE
+     requis) -> session avec deconnexion auto apres 45 s d'inactivite,
+     bouton "Terminer" pour fermer. Le retrait exige toujours le CODE
+     BANQUE ; voir son solde et deposer sont possibles sans code.
 Materiel de la borne :
   - un ORDINATEUR (Advanced conseille : ecran tactile) ;
   - un MODEM (pour joindre le serveur) ;
@@ -3775,16 +3807,17 @@ local function handle(senderId, msg)
     end
 
   -- ===================== ATM (distributeur) =====================
-  -- L'ATM s'authentifie par UID (lu sur le tel insere) + code banque.
+  -- L'ATM s'authentifie par UID (lu sur le tel insere) OU par pseudo
+  -- (tape au clavier de la borne) + code banque pour le retrait.
   -- Modele "solde seul" : depot = +, retrait = - (sur le solde serveur).
   elseif msg.action == "atm_info" then
-    local a = accByUid(msg.uid)
+    local a = msg.uid and accByUid(msg.uid) or accByUser(msg.user)
     if not a then rednet.send(senderId, { ok = false, action = "atm_info", error = "compte introuvable" }, PROTO)
-    else rednet.send(senderId, { ok = true, action = "atm_info", user = a.user,
+    else rednet.send(senderId, { ok = true, action = "atm_info", user = a.user, uid = a.uid,
                                  balance = a.balance, hasBankPass = a.bankPass ~= nil, feeRate = TAX_RATE }, PROTO) end
 
   elseif msg.action == "atm_deposit" then
-    local a = accByUid(msg.uid)
+    local a = msg.uid and accByUid(msg.uid) or accByUser(msg.user)
     local amount = math.floor(tonumber(msg.amount) or 0)
     if not a then rednet.send(senderId, { ok = false, action = "atm_deposit", error = "compte introuvable" }, PROTO)
     elseif amount <= 0 then rednet.send(senderId, { ok = false, action = "atm_deposit", error = "montant invalide" }, PROTO)
@@ -3798,7 +3831,7 @@ local function handle(senderId, msg)
     end
 
   elseif msg.action == "atm_withdraw" then
-    local a = accByUid(msg.uid)
+    local a = msg.uid and accByUid(msg.uid) or accByUser(msg.user)
     local amount = math.floor(tonumber(msg.amount) or 0)
     if not a then rednet.send(senderId, { ok = false, action = "atm_withdraw", error = "compte introuvable" }, PROTO)
     elseif a.bankPass == nil then rednet.send(senderId, { ok = false, action = "atm_withdraw", error = "aucun code banque : retrait impossible" }, PROTO)
