@@ -3395,31 +3395,48 @@ local function takeFee(user, amount)
 end
 
 -- reponse de l'API pour la commission en cours (appele par la boucle principale)
+-- Trois cas :
+--  - succes -> commission livree, on passe a la suivante ;
+--  - REFUS du site (erreur applicative OU code HTTP 4xx/5xx : cle refusee,
+--    IP non autorisee, pseudo/entreprise inconnu...) -> le VRAI message de
+--    l'API est logge, 5 essais puis abandon (ne bloque pas la file) ;
+--  - echec de CONNEXION (aucune reponse) -> nouvel essai sans limite.
 local function onFeeResponse(okHttp, handle, err)
   feeInFlight = false
-  if okHttp then
-    local body = handle.readAll() or ""; handle.close()
+  local refusal
+  if handle then
+    local body = ""
+    pcall(function() body = handle.readAll() or "" end)
+    pcall(handle.close)
     local okj, res = pcall(textutils.unserializeJSON, body)
-    if okj and type(res) == "table" and res.error then
-      -- refus applicatif (ex: pseudo inconnu cote site) : nouvel essai
-      -- plus tard ; abandon apres 5 refus pour ne pas bloquer la file
-      local f = table.remove(feeQueue, 1)
-      f.fails = (f.fails or 0) + 1
-      if f.fails >= 5 then
-        log("Commission ABANDONNEE (" .. tostring(res.error) .. ") : " .. f.amount .. " de " .. f.user)
-      else
-        feeQueue[#feeQueue + 1] = f
-        log("Commission refusee (" .. tostring(res.error) .. "), nouvel essai...")
-        feeRetryAt = os.clock() + 60
-      end
-      saveFees()
-    else
-      table.remove(feeQueue, 1); saveFees()
+    local apiMsg = (okj and type(res) == "table") and (res.error or res.message) or nil
+    if not okHttp then
+      refusal = tostring(apiMsg or err)   -- le site a repondu par une erreur HTTP
+    elseif apiMsg then
+      refusal = tostring(apiMsg)          -- HTTP 200 mais erreur applicative
     end
-  else
-    if handle then pcall(handle.close) end
+  elseif not okHttp then
+    -- aucune reponse du tout : vraie panne reseau, on garde la commission
     log("Commissions : site injoignable (" .. tostring(err) .. ")")
     feeRetryAt = os.clock() + 30
+    flushFees()
+    return
+  end
+  if refusal then
+    local f = table.remove(feeQueue, 1)
+    if f then
+      f.fails = (f.fails or 0) + 1
+      if f.fails >= 5 then
+        log("Commission ABANDONNEE (" .. refusal .. ") : " .. f.amount .. " de " .. f.user)
+      else
+        feeQueue[#feeQueue + 1] = f
+        log("Commission refusee par l'API : " .. refusal)
+        feeRetryAt = os.clock() + 60
+      end
+    end
+    saveFees()
+  else
+    table.remove(feeQueue, 1); saveFees()
   end
   flushFees()
 end
