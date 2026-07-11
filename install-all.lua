@@ -164,7 +164,7 @@ end
 -- Comptes & argent : voir les soldes, crediter / debiter.
 local function screenAccounts()
   while true do
-    local r = areq({ action = "admin_accounts" })
+    local r = areq({ action = "admin_accounts" }, 20)   -- soldes rafraichis via le site
     if not r then ui.message("Admin", { "Serveur injoignable" }); return end
     local accs = r.accounts or {}
     if #accs == 0 then ui.message("Comptes", { "Aucun compte cree." }); return end
@@ -181,7 +181,7 @@ local function screenAccounts()
     if amtS then
       local delta = math.floor(tonumber(amtS) or 0)
       if delta ~= 0 then
-        local rr = areq({ action = "admin_credit", user = a.user, amount = delta })
+        local rr = areq({ action = "admin_credit", user = a.user, amount = delta }, 15)
         if rr and rr.ok then ui.message("Solde", { a.user .. " : " .. tostring(rr.balance) .. " $" })
         else ui.message("Erreur", { (rr and rr.error) or "echec" }) end
       end
@@ -454,7 +454,7 @@ local function doDeposit(card, info)
   local amtS = ui.keypad("Depot - montant", { hint = "montant" })
   local amt = tonumber(amtS)
   if not amt then return end
-  local r = net.request({ action = "atm_deposit", uid = card.uid, user = card.user, amount = amt }, 6)
+  local r = net.request({ action = "atm_deposit", uid = card.uid, user = card.user, amount = amt }, 12)
   if r and r.ok then
     info.balance = r.balance
     local lines = { "Credite : +" .. (r.net or math.floor(amt)) .. " $" }
@@ -474,7 +474,7 @@ local function doWithdraw(card, info)
   local amtS = ui.keypad("Retrait - montant", { hint = "montant" })
   local amt = tonumber(amtS)
   if not amt then return end
-  local r = net.request({ action = "atm_withdraw", uid = card.uid, user = card.user, amount = amt, bankpass = code }, 6)
+  local r = net.request({ action = "atm_withdraw", uid = card.uid, user = card.user, amount = amt, bankpass = code }, 15)
   if r and r.ok then
     info.balance = r.balance
     local lines = { "Remis : " .. (r.net or math.floor(amt)) .. " $" }
@@ -485,7 +485,7 @@ local function doWithdraw(card, info)
 end
 
 local function session(card)
-  local info = net.request({ action = "atm_info", uid = card.uid, user = card.user }, 6)
+  local info = net.request({ action = "atm_info", uid = card.uid, user = card.user }, 10)
   if not (info and info.ok) then
     ui.message("ATM", { (info and info.error) or "Serveur injoignable" })
     return
@@ -940,7 +940,19 @@ Reglages > Se deconnecter. Ensuite l'auto-login reconnecte tout seul au reboot.
 
 APP BANQUE (pre-installee) : voir son solde, definir/changer un CODE BANQUE
 (demande a l'ouverture de l'app), et envoyer de l'argent a un autre pseudo.
-L'argent est 100% cote serveur (impossible a trafiquer depuis le tel).
+
+--- L'ARGENT VIT SUR LE SITE V-SMP (v3) ---
+Le solde des joueurs n'est PLUS stocke dans accounts.tbl : c'est le solde
+de la BANQUE DU SITE (API V-SMP, la meme que le ServeurCentral).
+  - Le pseudo d'un compte KIT DOIT etre le pseudo MINECRAFT du joueur
+    (verifie via l'API Mojang a la creation du compte ; l'UUID est cache).
+  - Lecture du solde (tel, ATM, admin) : GET /bank/balance/<uuid>.
+  - Debit/credit (transferts, ATM, credits admin) : POST /bank/withdraw
+    et /bank/deposit. Le solde est VERIFIE sur le site avant tout debit.
+  - Si le credit du destinataire echoue apres le debit, l'envoyeur est
+    REMBOURSE (comme le ServeurCentral).
+  - accounts.tbl ne garde que l'identite (pseudo, mdp, code banque, uid)
+    et un cache du dernier solde connu (affichage des listes).
 
 CREDITER / DEBITER un compte depuis le SERVEUR :
   Sur l'ecran du serveur, touche  C  -> tape le pseudo puis le montant
@@ -1471,7 +1483,7 @@ return function(sys)
   local ui, net = sys.ui, sys.net
 
   local function info()
-    local r = net.auth({ action = "bank_info" }, 5)
+    local r = net.auth({ action = "bank_info" }, 8)   -- le serveur interroge le site
     if r and r.ok then
       net.balance = r.balance or 0; net.hasBankPass = r.hasBankPass and true or false
       net.feeRate = r.feeRate or 0   -- taux de commission (preleve par le serveur)
@@ -1539,7 +1551,7 @@ return function(sys)
     local q = ("Envoyer %d a %s ?"):format(amt, to)
     if est > 0 then q = q .. (" Il recevra %d (commission %d)."):format(amt - est, est) end
     if not ui.confirm("Transfert", q) then return end
-    local resp = net.auth({ action = "bank_transfer", to = to, amount = amt, bankpass = bp }, 6)
+    local resp = net.auth({ action = "bank_transfer", to = to, amount = amt, bankpass = bp }, 15)
     if resp and resp.ok then
       net.balance = resp.balance or net.balance
       local lines = { ("Envoye : %d"):format(amt) }
@@ -3061,7 +3073,7 @@ files["repo/pocketos/package.info"] = [=[
 {
   name = "pocketos",
   desc = "PIL OS : comptes serveur, banque + ATM (carte /secu/id), chat, UI cartes/pave tactile.",
-  version = "2.3",
+  version = "2.4",
 }
 ]=]
 files["repo/snake/files/cobble/apps/snake.lua"] = [=[
@@ -3461,6 +3473,78 @@ local function retryFees()
   saveFees()
 end
 
+-- ============ Banque du SITE (V-SMP) ===========================
+-- L'ARGENT DES JOUEURS VIT SUR LE SITE, pas dans accounts.tbl :
+-- le pseudo d'un compte KIT = le pseudo MINECRAFT du joueur, et son
+-- argent est le solde de la banque du site (meme API que le
+-- ServeurCentral). a.balance n'est plus qu'un CACHE d'affichage.
+--  - lecture  : GET /bank/balance/<uuid minecraft>
+--  - debit    : POST /bank/withdraw (verif de solde faite AVANT)
+--  - credit   : POST /bank/deposit
+
+-- GET JSON simple (pour l'API Mojang), bloquant comme callAPI
+local function httpGetJSON(url)
+  if not http then return nil end
+  http.request({ url = url })
+  local event, u, p1, p2
+  repeat event, u, p1, p2 = os.pullEvent()
+  until (event == "http_success" or event == "http_failure") and u == url
+  if event == "http_failure" then
+    if p2 then pcall(p2.close) end
+    return nil
+  end
+  local body = p1.readAll(); p1.close()
+  local ok, t = pcall(textutils.unserializeJSON, body)
+  if ok then return t end
+  return nil
+end
+
+-- pseudo -> UUID Minecraft (API Mojang) ; mis en cache dans le compte
+local function resolveUUID(name)
+  local t = httpGetJSON("https://api.mojang.com/users/profiles/minecraft/" .. tostring(name))
+  if type(t) == "table" and t.id then return t.id end
+  return nil
+end
+local function mcUUID(a)
+  if not a.mcuuid then
+    a.mcuuid = resolveUUID(a.user)
+    if a.mcuuid then saveAccounts() end
+  end
+  return a.mcuuid
+end
+
+-- Solde lu sur le SITE. Renvoie (nombre) ou (nil, erreur).
+-- Le dernier solde connu est cache dans a.balance (listes / hors-ligne).
+local function apiBalance(a)
+  if not http then return nil, "http desactive" end
+  local uuid = mcUUID(a)
+  if not uuid then return nil, "pseudo Minecraft introuvable" end
+  local ok, res = callAPI("/bank/balance/" .. uuid)
+  if ok then
+    local b = tonumber(type(res) == "table" and (res.balance or res.amount or res.money) or res)
+    if b then a.balance = b; return b end
+  end
+  local msg = type(res) == "table" and (res.error or res.message) or res
+  return nil, tostring(msg or "erreur API")
+end
+
+-- solde a afficher : valeur fraiche du site si possible, sinon le cache
+local function balOf(a)
+  local b = apiBalance(a)
+  return b or a.balance or 0
+end
+
+-- Credit / debit du compte du SITE (le site refuse si fonds insuffisants)
+local function apiMove(endpoint, a, amount)
+  if not http then return false, "http desactive" end
+  local ok, res, code = callAPI(endpoint, { username = a.user, amount = amount })
+  if ok and not (type(res) == "table" and res.error) then return true end
+  local msg = type(res) == "table" and (res.error or res.message) or res
+  return false, tostring(msg or ("HTTP " .. tostring(code)))
+end
+local function apiDeposit(a, amount) return apiMove("/bank/deposit", a, amount) end
+local function apiWithdraw(a, amount) return apiMove("/bank/withdraw", a, amount) end
+
 -- ============ Reseau ============================================
 local function openModems()
   local found = false
@@ -3701,16 +3785,23 @@ local function handle(senderId, msg)
     elseif accounts[key] then
       rednet.send(senderId, { ok = false, action = "signup", error = "pseudo deja pris" }, PROTO)
     else
-      local a = { user = u, pass = hashpw(msg.pass, key), uid = nextUid, balance = 0,
-                  bankPass = nil, data = { name = u }, token = newToken(), created = os.epoch("utc") }
-      nextUid = nextUid + 1
-      accounts[key] = a
-      touch(a.uid, senderId)
-      saveAccounts()
-      clients[senderId] = { name = u, uid = a.uid, last = os.clock() }
-      rednet.send(senderId, { ok = true, action = "signup", uid = a.uid, token = a.token,
-                              profile = a.data, balance = a.balance, hasBankPass = false }, PROTO)
-      log("Nouveau compte : " .. u .. " (uid " .. a.uid .. ")")
+      -- l'argent vit sur le SITE : le pseudo doit etre un vrai pseudo MINECRAFT
+      local uuid = resolveUUID(u)
+      if not uuid then
+        rednet.send(senderId, { ok = false, action = "signup",
+          error = "pseudo Minecraft introuvable : utilise TON pseudo en jeu" }, PROTO)
+      else
+        local a = { user = u, pass = hashpw(msg.pass, key), uid = nextUid, balance = 0, mcuuid = uuid,
+                    bankPass = nil, data = { name = u }, token = newToken(), created = os.epoch("utc") }
+        nextUid = nextUid + 1
+        accounts[key] = a
+        touch(a.uid, senderId)
+        saveAccounts()
+        clients[senderId] = { name = u, uid = a.uid, last = os.clock() }
+        rednet.send(senderId, { ok = true, action = "signup", uid = a.uid, token = a.token,
+                                profile = a.data, balance = balOf(a), hasBankPass = false }, PROTO)
+        log("Nouveau compte : " .. u .. " (uid " .. a.uid .. ")")
+      end
     end
 
   elseif msg.action == "login" then
@@ -3726,7 +3817,7 @@ local function handle(senderId, msg)
         saveAccounts()
         clients[senderId] = { name = (a.data and a.data.name) or a.user, uid = a.uid, last = os.clock() }
         rednet.send(senderId, { ok = true, action = "login", uid = a.uid, token = a.token,
-                                profile = a.data, balance = a.balance, hasBankPass = a.bankPass ~= nil }, PROTO)
+                                profile = a.data, balance = balOf(a), hasBankPass = a.bankPass ~= nil }, PROTO)
         log("Login : " .. a.user)
       end
     end
@@ -3745,7 +3836,7 @@ local function handle(senderId, msg)
         touch(a.uid, senderId)
         clients[senderId] = { name = (a.data and a.data.name) or a.user, uid = a.uid, last = os.clock() }
         rednet.send(senderId, { ok = true, action = "resume", uid = a.uid, token = a.token,
-                                profile = a.data, balance = a.balance, hasBankPass = a.bankPass ~= nil }, PROTO)
+                                profile = a.data, balance = balOf(a), hasBankPass = a.bankPass ~= nil }, PROTO)
         log("Reprise session : " .. a.user)
       end
     end
@@ -3770,7 +3861,7 @@ local function handle(senderId, msg)
   elseif msg.action == "getprofile" then
     local a = authOK(msg.uid, msg.token, senderId)
     if a then rednet.send(senderId, { ok = true, action = "getprofile", profile = a.data,
-                                      balance = a.balance, hasBankPass = a.bankPass ~= nil }, PROTO)
+                                      balance = balOf(a), hasBankPass = a.bankPass ~= nil }, PROTO)
     else rednet.send(senderId, { ok = false, action = "getprofile", error = "non authentifie" }, PROTO) end
 
   elseif msg.action == "setprofile" then
@@ -3788,9 +3879,17 @@ local function handle(senderId, msg)
   -- ===================== BANQUE =====================
   elseif msg.action == "bank_info" then
     local a = authOK(msg.uid, msg.token, senderId)
-    if a then rednet.send(senderId, { ok = true, action = "bank_info", balance = a.balance,
-                                      hasBankPass = a.bankPass ~= nil, user = a.user, feeRate = TAX_RATE }, PROTO)
-    else rednet.send(senderId, { ok = false, action = "bank_info", error = "non authentifie" }, PROTO) end
+    if not a then
+      rednet.send(senderId, { ok = false, action = "bank_info", error = "non authentifie" }, PROTO)
+    else
+      local b, berr = apiBalance(a)   -- solde lu sur le SITE
+      if not b then
+        rednet.send(senderId, { ok = false, action = "bank_info", error = "banque du site : " .. tostring(berr) }, PROTO)
+      else
+        rednet.send(senderId, { ok = true, action = "bank_info", balance = b,
+                                hasBankPass = a.bankPass ~= nil, user = a.user, feeRate = TAX_RATE }, PROTO)
+      end
+    end
 
   elseif msg.action == "bank_setpass" then
     local a = authOK(msg.uid, msg.token, senderId)
@@ -3826,21 +3925,42 @@ local function handle(senderId, msg)
         rednet.send(senderId, { ok = false, action = "bank_transfer", error = "destinataire introuvable" }, PROTO)
       elseif dest.uid == a.uid then
         rednet.send(senderId, { ok = false, action = "bank_transfer", error = "destinataire = vous-meme" }, PROTO)
-      elseif a.balance < amount then
-        rednet.send(senderId, { ok = false, action = "bank_transfer", error = "solde insuffisant" }, PROTO)
       else
-        local f = feeOf(amount)
-        a.balance = a.balance - amount; dest.balance = dest.balance + (amount - f); saveAccounts()
-        log(("Transfert %d (comm. %d) : %s -> %s"):format(amount, f, a.user, dest.user))
-        for pid, c in pairs(clients) do
-          if c.uid == dest.uid then
-            rednet.send(pid, { ok = true, action = "bank_event",
-                               text = ("Recu %d de %s"):format(amount - f, a.user), balance = dest.balance }, PROTO)
+        -- 1) VERIF du solde sur le SITE  2) debit  3) credit (remboursement si echec)
+        local bal, berr = apiBalance(a)
+        if not bal then
+          rednet.send(senderId, { ok = false, action = "bank_transfer", error = "banque du site : " .. tostring(berr) }, PROTO)
+        elseif bal < amount then
+          rednet.send(senderId, { ok = false, action = "bank_transfer", error = "solde insuffisant (site : " .. bal .. ")" }, PROTO)
+        else
+          local ok1, e1 = apiWithdraw(a, amount)
+          if not ok1 then
+            rednet.send(senderId, { ok = false, action = "bank_transfer", error = "debit refuse : " .. tostring(e1) }, PROTO)
+          else
+            local f = feeOf(amount)
+            local ok2, e2 = apiDeposit(dest, amount - f)
+            if not ok2 then
+              -- remboursement, comme le ServeurCentral en cas d'echec
+              if not apiDeposit(a, amount) then
+                log(("CRITIQUE : remboursement echoue, %d perdus pour %s"):format(amount, a.user))
+              end
+              rednet.send(senderId, { ok = false, action = "bank_transfer", error = "credit refuse : " .. tostring(e2) }, PROTO)
+            else
+              a.balance = bal - amount
+              dest.balance = (dest.balance or 0) + (amount - f)
+              log(("Transfert %d (comm. %d) : %s -> %s"):format(amount, f, a.user, dest.user))
+              for pid, c in pairs(clients) do
+                if c.uid == dest.uid then
+                  rednet.send(pid, { ok = true, action = "bank_event",
+                                     text = ("Recu %d de %s"):format(amount - f, a.user), balance = dest.balance }, PROTO)
+                end
+              end
+              rednet.send(senderId, { ok = true, action = "bank_transfer", balance = a.balance,
+                                      fee = f, net = amount - f }, PROTO)
+              deliverFee(a.user, f)
+            end
           end
         end
-        rednet.send(senderId, { ok = true, action = "bank_transfer", balance = a.balance,
-                                fee = f, net = amount - f }, PROTO)
-        deliverFee(a.user, f)
       end
     end
 
@@ -3851,8 +3971,12 @@ local function handle(senderId, msg)
   elseif msg.action == "atm_info" then
     local a = msg.uid and accByUid(msg.uid) or accByUser(msg.user)
     if not a then rednet.send(senderId, { ok = false, action = "atm_info", error = "compte introuvable" }, PROTO)
-    else rednet.send(senderId, { ok = true, action = "atm_info", user = a.user, uid = a.uid,
-                                 balance = a.balance, hasBankPass = a.bankPass ~= nil, feeRate = TAX_RATE }, PROTO) end
+    else
+      local b, berr = apiBalance(a)   -- solde lu sur le SITE
+      if not b then rednet.send(senderId, { ok = false, action = "atm_info", error = "banque du site : " .. tostring(berr) }, PROTO)
+      else rednet.send(senderId, { ok = true, action = "atm_info", user = a.user, uid = a.uid,
+                                   balance = b, hasBankPass = a.bankPass ~= nil, feeRate = TAX_RATE }, PROTO) end
+    end
 
   elseif msg.action == "atm_deposit" then
     local a = msg.uid and accByUid(msg.uid) or accByUser(msg.user)
@@ -3861,12 +3985,17 @@ local function handle(senderId, msg)
     elseif amount <= 0 then rednet.send(senderId, { ok = false, action = "atm_deposit", error = "montant invalide" }, PROTO)
     else
       local f = feeOf(amount)
-      a.balance = a.balance + (amount - f); saveAccounts()
-      log(("ATM depot %d (comm. %d) -> %s (%d)"):format(amount, f, a.user, a.balance))
-      for pid, c in pairs(clients) do if c.uid == a.uid then
-        rednet.send(pid, { ok = true, action = "bank_event", text = "Depot ATM +" .. (amount - f), balance = a.balance }, PROTO) end end
-      rednet.send(senderId, { ok = true, action = "atm_deposit", balance = a.balance, fee = f, net = amount - f }, PROTO)
-      deliverFee(a.user, f)
+      local ok1, e1 = apiDeposit(a, amount - f)   -- credit sur le SITE
+      if not ok1 then
+        rednet.send(senderId, { ok = false, action = "atm_deposit", error = "banque du site : " .. tostring(e1) }, PROTO)
+      else
+        a.balance = (a.balance or 0) + (amount - f)
+        log(("ATM depot %d (comm. %d) -> %s (%d)"):format(amount, f, a.user, a.balance))
+        for pid, c in pairs(clients) do if c.uid == a.uid then
+          rednet.send(pid, { ok = true, action = "bank_event", text = "Depot ATM +" .. (amount - f), balance = a.balance }, PROTO) end end
+        rednet.send(senderId, { ok = true, action = "atm_deposit", balance = a.balance, fee = f, net = amount - f }, PROTO)
+        deliverFee(a.user, f)
+      end
     end
 
   elseif msg.action == "atm_withdraw" then
@@ -3876,15 +4005,27 @@ local function handle(senderId, msg)
     elseif a.bankPass == nil then rednet.send(senderId, { ok = false, action = "atm_withdraw", error = "aucun code banque : retrait impossible" }, PROTO)
     elseif a.bankPass ~= hashpw(msg.bankpass or "", "bank" .. a.uid) then rednet.send(senderId, { ok = false, action = "atm_withdraw", error = "code banque incorrect" }, PROTO)
     elseif amount <= 0 then rednet.send(senderId, { ok = false, action = "atm_withdraw", error = "montant invalide" }, PROTO)
-    elseif a.balance < amount then rednet.send(senderId, { ok = false, action = "atm_withdraw", error = "solde insuffisant" }, PROTO)
     else
-      local f = feeOf(amount)
-      a.balance = a.balance - amount; saveAccounts()
-      log(("ATM retrait %d (comm. %d) -> %s (%d)"):format(amount, f, a.user, a.balance))
-      for pid, c in pairs(clients) do if c.uid == a.uid then
-        rednet.send(pid, { ok = true, action = "bank_event", text = "Retrait ATM -" .. amount, balance = a.balance }, PROTO) end end
-      rednet.send(senderId, { ok = true, action = "atm_withdraw", balance = a.balance, fee = f, net = amount - f }, PROTO)
-      deliverFee(a.user, f)
+      -- VERIF du solde sur le SITE avant de prelever
+      local bal, berr = apiBalance(a)
+      if not bal then
+        rednet.send(senderId, { ok = false, action = "atm_withdraw", error = "banque du site : " .. tostring(berr) }, PROTO)
+      elseif bal < amount then
+        rednet.send(senderId, { ok = false, action = "atm_withdraw", error = "solde insuffisant (site : " .. bal .. ")" }, PROTO)
+      else
+        local ok1, e1 = apiWithdraw(a, amount)   -- debit sur le SITE
+        if not ok1 then
+          rednet.send(senderId, { ok = false, action = "atm_withdraw", error = "debit refuse : " .. tostring(e1) }, PROTO)
+        else
+          local f = feeOf(amount)
+          a.balance = bal - amount
+          log(("ATM retrait %d (comm. %d) -> %s (%d)"):format(amount, f, a.user, a.balance))
+          for pid, c in pairs(clients) do if c.uid == a.uid then
+            rednet.send(pid, { ok = true, action = "bank_event", text = "Retrait ATM -" .. amount, balance = a.balance }, PROTO) end end
+          rednet.send(senderId, { ok = true, action = "atm_withdraw", balance = a.balance, fee = f, net = amount - f }, PROTO)
+          deliverFee(a.user, f)
+        end
+      end
     end
 
   elseif msg.action == "atm_app" then
@@ -4017,8 +4158,10 @@ local function handle(senderId, msg)
 
   elseif msg.action == "admin_accounts" then
     local list = {}
+    local apiUp = true   -- au 1er echec on garde le cache (evite N timeouts)
     for _, a in pairs(accounts) do
-      list[#list + 1] = { user = a.user, uid = a.uid, balance = a.balance, online = active[a.uid] ~= nil }
+      if apiUp and not apiBalance(a) then apiUp = false end   -- rafraichit depuis le SITE
+      list[#list + 1] = { user = a.user, uid = a.uid, balance = a.balance or 0, online = active[a.uid] ~= nil }
     end
     table.sort(list, function(x, y) return x.user:lower() < y.user:lower() end)
     rednet.send(senderId, { ok = true, action = "admin_accounts", accounts = list }, PROTO)
@@ -4029,14 +4172,23 @@ local function handle(senderId, msg)
       rednet.send(senderId, { ok = false, action = "admin_credit", error = "compte introuvable" }, PROTO)
     else
       local delta = math.floor(tonumber(msg.amount) or 0)
-      a.balance = math.max(0, a.balance + delta); saveAccounts()
-      log(("Admin credit %s : %+d -> %d"):format(a.user, delta, a.balance))
-      for pid, c in pairs(clients) do
-        if c.uid == a.uid then
-          rednet.send(pid, { ok = true, action = "bank_event", text = "Solde ajuste par l'admin", balance = a.balance }, PROTO)
+      -- edition du solde via l'API du SITE
+      local ok2, err2
+      if delta > 0 then ok2, err2 = apiDeposit(a, delta)
+      elseif delta < 0 then ok2, err2 = apiWithdraw(a, -delta)
+      else ok2, err2 = false, "montant nul" end
+      if not ok2 then
+        rednet.send(senderId, { ok = false, action = "admin_credit", error = tostring(err2) }, PROTO)
+      else
+        local b = balOf(a)
+        log(("Admin credit %s : %+d -> %d"):format(a.user, delta, b))
+        for pid, c in pairs(clients) do
+          if c.uid == a.uid then
+            rednet.send(pid, { ok = true, action = "bank_event", text = "Solde ajuste par l'admin", balance = b }, PROTO)
+          end
         end
+        rednet.send(senderId, { ok = true, action = "admin_credit", balance = b, user = a.user }, PROTO)
       end
-      rednet.send(senderId, { ok = true, action = "admin_credit", balance = a.balance, user = a.user }, PROTO)
     end
   end
 end
@@ -4073,16 +4225,20 @@ local function doCreditCommand()
   if not u or u == "" then return end
   local a = accByUser(u)
   if not a then log("Compte introuvable : " .. u); return end
-  local amt = prompt(("Montant (+/-) pour %s [solde %d] : "):format(a.user, a.balance))
+  local amt = prompt(("Montant (+/-) pour %s [solde site %d] : "):format(a.user, balOf(a)))
   local delta = math.floor(tonumber(amt) or 0)
   if delta == 0 then return end
-  a.balance = math.max(0, a.balance + delta); saveAccounts()
+  -- edition du solde via l'API du SITE
+  local ok2, err2
+  if delta > 0 then ok2, err2 = apiDeposit(a, delta) else ok2, err2 = apiWithdraw(a, -delta) end
+  if not ok2 then log("Credit refuse : " .. tostring(err2)); return end
+  local b = balOf(a)
   for pid, c in pairs(clients) do
     if c.uid == a.uid then
-      rednet.send(pid, { ok = true, action = "bank_event", text = "Solde ajuste par l'admin", balance = a.balance }, PROTO)
+      rednet.send(pid, { ok = true, action = "bank_event", text = "Solde ajuste par l'admin", balance = b }, PROTO)
     end
   end
-  log(("Credit %s : %+d -> %d"):format(a.user, delta, a.balance))
+  log(("Credit %s : %+d -> %d"):format(a.user, delta, b))
 end
 
 local function redraw()
@@ -4141,7 +4297,7 @@ print("Mot de passe ADMIN de la console (vide = 'kit') :")
 write("> ")
 local adminPass = read("*")
 if adminPass == "" then adminPass = "kit" end
-print("Cle API V-SMP pour les commissions")
+print("Cle API V-SMP pour la banque et les commissions")
 print("(vide = a completer plus tard dans server.lua) :")
 write("> ")
 local apiKey = read()
@@ -4181,9 +4337,9 @@ if not hasModem then
 end
 if keyLater then
   print("")
-  print("RAPPEL : pas de cle API saisie. Les commissions")
-  print("resteront en attente tant que VSMP_API_KEY n'est")
-  print("pas remplie en haut de server.lua (edit server.lua).")
+  print("RAPPEL : pas de cle API saisie. La banque et les")
+  print("commissions ne marcheront pas tant que VSMP_API_KEY")
+  print("n'est pas remplie en haut de server.lua.")
 end
 print("")
 print("Redemarrage sur le serveur dans 3 s...")
